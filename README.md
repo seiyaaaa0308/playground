@@ -43,14 +43,14 @@ docker compose exec client ip route
 docker compose exec client ping -c 2 172.16.0.1
 ```
 
-クライアントから直接サーバ側IPへアクセスするのではなく、NATルータの転送ポートを使います。
+HTTPSを通常の確認経路として使います。クライアントから直接サーバ側IPへアクセスせず、NATルータの転送ポートを通します。
 
 ```sh
-docker compose exec client curl --resolve web.lab.test:8080:172.16.0.1 http://web.lab.test:8080/
 docker compose exec client curl -k --resolve web.lab.test:8443:172.16.0.1 https://web.lab.test:8443/
+docker compose exec client curl --resolve web.lab.test:8080:172.16.0.1 http://web.lab.test:8080/
 ```
 
-繰り返し実行すると、応答本文が `web1` と `web2` の間で切り替わります。自己署名証明書のため、HTTPSの検証では `-k` を付けています。ホストからは `http://localhost:8080/` および `https://localhost:8443/` で確認できます。
+HTTPSは自己署名証明書のため、検証時に `-k` を付けています。繰り返し実行すると、HTTPSの応答本文が `web1` と `web2` の間で切り替わります。HTTPは暗号化されない補助経路です。ホストからは主に `https://localhost:8443/` で確認できます。
 
 NAT/firewalldの状態とパケットを確認します。
 
@@ -66,13 +66,15 @@ docker compose exec router tcpdump -ni any 'host 172.16.0.10 or host 172.24.0.10
 
 ## firewalld実験
 
-ルータ上でDNATルールを一時削除してHTTP疎通を確認し、元に戻します。
+ルータ上でHTTPS用DNATルールを一時削除して、TLS接続が失敗することを確認し、必ず元に戻します。
 
 ```sh
-docker compose exec router firewall-cmd --zone=client --remove-forward-port=port=8080:proto=tcp:toaddr=172.24.0.10:toport=80
-docker compose exec client curl --connect-timeout 3 --resolve web.lab.test:8080:172.16.0.1 http://web.lab.test:8080/
-docker compose exec router firewall-cmd --zone=client --add-forward-port=port=8080:proto=tcp:toaddr=172.24.0.10:toport=80
+docker compose exec router firewall-cmd --zone=client --remove-forward-port=port=8443:proto=tcp:toaddr=172.24.0.10:toport=443
+docker compose exec client curl -k --connect-timeout 3 --resolve web.lab.test:8443:172.16.0.1 https://web.lab.test:8443/
+docker compose exec router firewall-cmd --zone=client --add-forward-port=port=8443:proto=tcp:toaddr=172.24.0.10:toport=443
 ```
+
+DNATルールを外している間の `curl` は失敗するのが正常です。最後のコマンドで転送を復旧してください。
 
 永続設定ではなく、コンテナを再作成すると起動時設定へ戻ります。nftablesルールはfirewalldが管理するため、実験中に `nft flush ruleset` を実行するとfirewalldの通信も壊れます。まず `nft list ruleset` でルールを観察し、変更は `firewall-cmd` から行ってください。
 
