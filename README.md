@@ -1,25 +1,27 @@
 # Netfilter 学習用 Docker ネットワーク
 
-Docker Compose で、クライアント側とサーバ側を分離したNAT/firewalld実験環境を起動します。クライアントからサーバ側への経路はNATルータだけを通り、Nginxリバースプロキシの背後に2台のNginx Webサーバを配置します。各コンテナに iproute2、net-tools、iptables、nftables、firewalld、tcpdump、curl、ping、DNSツールを含めています。
+Docker Compose で、クライアント側とサーバ側を分離したNAT/firewalld実験環境を起動します。クライアントからサーバ側への経路はNATルータだけを通り、Nginxリバースプロキシの背後に2台のNginx Webサーバを配置します。各コンテナに iproute2、net-tools、iptables、nftables、firewalld、tcpdump、curl、ping、DNSツールを含め、clientにはDHCPクライアント、DNS/DHCPサーバにはdnsmasqを含めています。
 
 ## ネットワーク構成
 
 ```text
-client (172.16.0.10)
+client (DHCP: 172.16.0.10–99)
     |
-    | client_net: 172.16.0.0/24 (internal)
-    |
-nat / firewalld
-  client: 172.16.0.1
-  server: 172.24.0.1
-    |
-    | server_net: 172.24.0.0/24 (internal)
-    +-- reverse-proxy: 172.24.0.10
-    |      +-- web1: 172.24.0.11
-    |      +-- web2: 172.24.0.12
+    | client_net: 172.16.0.0/24 (Docker bridge; outbound masquerading disabled)
+    +-- dhcp: 172.16.0.2
+    |      DNS: web.lab.test, router.lab.test
+    |      DHCP: 172.16.0.10–99
+    +-- nat / firewalld
+           client: 172.16.0.1
+           server: 172.24.0.1
+               |
+               | server_net: 172.24.0.0/24 (internal)
+               +-- proxy: 172.24.0.10
+                      +-- server1: 172.24.0.11
+                      +-- server2: 172.24.0.12
 ```
 
-両ネットワークをDockerの `internal` ネットワークにして外部への直接経路を閉じています。クライアントのデフォルトゲートウェイは `172.16.0.1` です。ルータはfirewalldで `client -> server` の転送を許可してmasqueradeし、`8080 -> 172.24.0.10:80`、`8443 -> 172.24.0.10:443` をDNATします。サーバからの応答はSNATされたルータのアドレスへ返るため、クライアントとサーバ間の直接経路は不要です。
+server_netはDockerの `internal` ネットワークです。client_netはDHCPの初回ブロードキャストをDockerが遮断しないよう通常のbridgeネットワークにしつつ、Dockerの外向きmasqueradeを無効にしています。clientはDockerがDHCP用に割り当てた一時アドレスを使ってリースを取得し、その後そのアドレスを外して、dnsmasqから `172.16.0.10–99` のアドレス、デフォルトゲートウェイ (`172.16.0.1`)、DNSサーバ (`172.16.0.2`) を使います。Dockerの一時アドレス範囲 `172.16.0.128/25` はDHCPリース範囲と重なりません。`web.lab.test` はNATルータの `172.16.0.1` に解決され、`router.lab.test` も同じアドレスを返します。ルータはfirewalldで `client -> server` の転送だけを許可してmasqueradeし、`8080 -> 172.24.0.10:80`、`8443 -> 172.24.0.10:443` をDNATします。サーバからの応答はSNATされたルータのアドレスへ返るため、クライアントとサーバ間の直接経路は不要です。
 
 ## 起動
 
@@ -31,7 +33,7 @@ docker compose up -d --build
 docker compose ps
 ```
 
-ルータには `NET_ADMIN` と `NET_RAW` capability、およびIPv4 forwardingを付与しています。ホストカーネルとDockerの設定によってはfirewalld/nftables操作が制限されることがあります。
+ルータには `NET_ADMIN` と `NET_RAW` capability、およびIPv4 forwardingを付与しています。DHCPサーバにもdnsmasqがDHCP応答パケットを送信するための `NET_ADMIN` と `NET_RAW` capabilityを付与しています。ホストカーネルとDockerの設定によってはfirewalld/nftables操作が制限されることがあります。
 
 ## 検証
 
@@ -40,17 +42,19 @@ docker compose ps
 ```sh
 docker compose exec client ip -br address
 docker compose exec client ip route
+docker compose exec client cat /etc/resolv.conf
+docker compose exec client dig web.lab.test
 docker compose exec client ping -c 2 172.16.0.1
 ```
 
 HTTPSを通常の確認経路として使います。クライアントから直接サーバ側IPへアクセスせず、NATルータの転送ポートを通します。
 
 ```sh
-docker compose exec client curl -k --resolve web.lab.test:8443:172.16.0.1 https://web.lab.test:8443/
-docker compose exec client curl --resolve web.lab.test:8080:172.16.0.1 http://web.lab.test:8080/
+docker compose exec client curl -k https://web.lab.test:8443/
+docker compose exec client curl http://web.lab.test:8080/
 ```
 
-HTTPSは自己署名証明書のため、検証時に `-k` を付けています。繰り返し実行すると、HTTPSの応答本文が `web1` と `web2` の間で切り替わります。HTTPは暗号化されない補助経路です。ホストからは主に `https://localhost:8443/` で確認できます。
+DNSで `web.lab.test` が `172.16.0.1` に解決され、その名前のままNATルータの公開ポートを通ってproxyへ到達します。HTTPSは自己署名証明書のため、検証時に `-k` を付けています。繰り返し実行すると、HTTPSの応答本文が `server1` と `server2` の間で切り替わります。HTTPは暗号化されない補助経路です。ホストからは主に `https://localhost:8443/` で確認できます。
 
 NAT/firewalldの状態とパケットを確認します。
 
@@ -70,7 +74,7 @@ docker compose exec router tcpdump -ni any 'host 172.16.0.10 or host 172.24.0.10
 
 ```sh
 docker compose exec router firewall-cmd --zone=client --remove-forward-port=port=8443:proto=tcp:toaddr=172.24.0.10:toport=443
-docker compose exec client curl -k --connect-timeout 3 --resolve web.lab.test:8443:172.16.0.1 https://web.lab.test:8443/
+docker compose exec client curl -k --connect-timeout 3 https://web.lab.test:8443/
 docker compose exec router firewall-cmd --zone=client --add-forward-port=port=8443:proto=tcp:toaddr=172.24.0.10:toport=443
 ```
 
